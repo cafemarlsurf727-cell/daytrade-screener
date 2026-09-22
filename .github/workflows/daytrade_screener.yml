@@ -3,6 +3,8 @@ on:
   schedule:
     - cron: "30 22 * * 0-4"
   workflow_dispatch: {}
+permissions:
+  contents: write
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -12,8 +14,16 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install pandas numpy yfinance requests
-      - run: python daytrade_screener.py --capital 1000000 --dry-run
+      - run: python daytrade_screener.py --capital 1000000
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          PAGES_URL: "https://cafemarlsurf727-cell.github.io/daytrade-screener/"
+      - name: レポートHTMLをコミット
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git diff --staged --quiet || git commit -m "chore: update daytrade report"
+          git push
