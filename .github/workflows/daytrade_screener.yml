@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install pandas numpy yfinance requests
-      - run: python daytrade_screener.py --capital 1000000
+      - run: python daytrade_screener.py --capital 1000000 --tickers-file tse_tickers_trimmed.csv
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
