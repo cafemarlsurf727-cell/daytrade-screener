@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>デイトレ候補レポート | 2026-09-22 (Tue)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --accent: #22e6ff;
+    --accent-soft: rgba(34, 230, 255, 0.07);
+    --accent-magenta: #ff3ec8;
+    --bg: #020305;
+    --panel: #060a12;
+    --panel-border: rgba(34, 230, 255, 0.15);
+    --border: rgba(34, 230, 255, 0.18);
+    --text: #c9edf5;
+    --text-dim: #5d7d87;
+    --danger: #ff4d6d;
+    --warn: #ffcc33;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Share Tech Mono', 'Courier New', monospace;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  body {
+    background-image:
+      radial-gradient(circle at 15% 8%, var(--accent-soft), transparent 38%),
+      radial-gradient(circle at 88% 0%, rgba(255,62,200,0.035), transparent 32%);
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 24px 16px 60px; }
+  header { margin-bottom: 20px; }
+  .title {
+    font-size: 1.6rem;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    text-shadow: 0 0 6px rgba(34,230,255,0.35);
+    margin: 0 0 4px;
+  }
+  .date { color: var(--text-dim); margin: 0; }
+  .warning-banner {
+    border: 1px solid var(--danger);
+    background: rgba(255, 77, 109, 0.08);
+    color: var(--danger);
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin: 16px 0 24px;
+    font-weight: bold;
+  }
+  .breadth-panel {
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 24px;
+  }
+  .breadth-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .breadth-label { color: var(--text-dim); font-size: 0.85rem; }
+  .breadth-value { color: var(--accent); font-size: 1.1rem; }
+  .gauge {
+    height: 8px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 4px;
+    margin-top: 10px;
+    overflow: hidden;
+  }
+  .gauge-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-magenta));
+    width: 47.8%;
+  }
+  .overheated-tag {
+    display: inline-block;
+    margin-top: 8px;
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .card {
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 16px;
+    transition: border-color .2s;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .ticker { color: var(--accent); font-weight: bold; letter-spacing: 0.05em; }
+  .side-badge {
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+  }
+  .side-buy { color: var(--accent); }
+  .side-sell { color: var(--accent-magenta); }
+  .name { margin: 4px 0; font-size: 1.02rem; color: var(--text); }
+  .strategy { color: var(--text-dim); font-size: 0.82rem; margin: 0 0 10px; }
+  .metrics {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+    margin: 0;
+  }
+  .metrics dt { color: var(--text-dim); font-size: 0.72rem; }
+  .metrics dd { margin: 0; color: var(--text); font-size: 0.92rem; }
+  .card-warning {
+    margin: 10px 0 0;
+    color: var(--warn);
+    font-size: 0.78rem;
+  }
+  .empty-state {
+    color: var(--text-dim);
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    text-align: center;
+  }
+  footer {
+    margin-top: 32px;
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    text-align: center;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #05070d; --text: #d9f9ff; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="title">DAYTRADE SIGNAL REPORT</p>
+      <p class="date">2026-09-22 (Tue)</p>
+    </header>
+
+    <div class="warning-banner">
+      ⚠ 全ポジション、当日大引け(15:00)までに手仕舞いすること。持ち越し厳禁。
+    </div>
+
+    <section class="breadth-panel">
+      <div class="breadth-row">
+        <span class="breadth-label">市場地合い（騰落レシオ）</span>
+        <span class="breadth-value">95.7%</span>
+      </div>
+      <div class="gauge"><div class="gauge-fill"></div></div>
+      <div class="breadth-row" style="margin-top:8px;">
+        <span class="breadth-label">平均5日移動平均乖離率</span>
+        <span class="breadth-value">0.60%</span>
+      </div>
+      
+      <div class="breadth-row" style="margin-top:8px;">
+        <span class="breadth-label">総資金 / 許容リスク</span>
+        <span class="breadth-value">1,000,000円 / 1.0%</span>
+      </div>
+    </section>
+
+    <section class="grid">
+      <p class="empty-state">本日は条件を満たす候補銘柄がありません。無理に売買しないこと。</p>
+    </section>
+
+    <footer>
+      本レポートは教育・研究目的のサンプル出力です。投資判断は自己責任で行ってください。<br>
+      Generated by daytrade_screener.py
+    </footer>
+  </div>
+</body>
+</html>
