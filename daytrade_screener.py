@@ -67,6 +67,8 @@
         # UTC 22:30 = 日本時間 翌7:30（平日のみ。UTC基準なので日付ずれに注意）
         - cron: "30 22 * * 0-4"
       workflow_dispatch: {}
+    permissions:
+      contents: write   # レポートHTMLをリポジトリに書き戻すために必要
     jobs:
       run:
         runs-on: ubuntu-latest
@@ -81,6 +83,24 @@
               DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
               LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
               LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+              # 例: https://ユーザー名.github.io/リポジトリ名/
+              PAGES_URL: "https://<ユーザー名>.github.io/<リポジトリ名>/"
+          - name: レポートHTMLをコミット
+            run: |
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add docs/index.html
+              git diff --staged --quiet || git commit -m "chore: update daytrade report"
+              git push
+
+----------------------------------------------------------------------------
+■ GitHub Pages の有効化（初回のみ・GUI操作）
+----------------------------------------------------------------------------
+    1) リポジトリの Settings → Pages を開く
+    2) "Build and deployment" の Source を "Deploy from a branch" にする
+    3) Branch を "main" / フォルダを "/docs" にして Save
+    4) 数分後、https://<ユーザー名>.github.io/<リポジトリ名>/ でレポートが閲覧可能になる
+       （上記ワークフローの PAGES_URL をこのURLに合わせておくこと）
 
 ============================================================================
 """
@@ -677,22 +697,335 @@ class Notifier:
             logger.error("LINE通知の送信に失敗しました: %s", exc)
             return False
 
-    def notify(self, signals: list[dict], breadth: dict[str, float], dry_run: bool = False) -> None:
-        message = self.format_message(signals, breadth)
+    @staticmethod
+    def format_short_message(
+        signals: list[dict], breadth: dict[str, float], pages_url: Optional[str] = None
+    ) -> str:
+        """
+        LINE等向けの短い通知文。詳細はレポートページ側に任せ、
+        通知はスマホ通知欄で一目で分かる要約に絞る。
+        """
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        buy_count = sum(1 for s in signals if s["side"] == "buy")
+        sell_count = sum(1 for s in signals if s["side"] == "sell")
+
+        lines = [f"【デイトレ候補】{today_str}"]
+        if signals:
+            lines.append(f"検出 {len(signals)}件（買い{buy_count} / 空売り{sell_count}）")
+        else:
+            lines.append("本日は該当銘柄なし。無理に売買しないこと。")
+        lines.append(f"地合い(騰落レシオ): {breadth['ad_ratio']:.1f}%")
+        lines.append("※15:00までに全決済。")
+        if pages_url:
+            lines.append(f"詳細: {pages_url}")
+        return "\n".join(lines)
+
+    def notify(
+        self,
+        signals: list[dict],
+        breadth: dict[str, float],
+        dry_run: bool = False,
+        pages_url: Optional[str] = None,
+    ) -> None:
+        full_message = self.format_message(signals, breadth)
         print("\n" + "=" * 70)
-        print(message)
+        print(full_message)
         print("=" * 70 + "\n")
 
         if dry_run:
             logger.info("--dry-run 指定のため外部通知は送信しません。")
             return
 
-        self.send_discord(message)
-        self.send_line(message)
+        # Discordは詳細をそのまま送る。LINEはレポートページへの導線として
+        # 短い要約＋リンクのみ送る（pages_url未指定時はDiscordと同じ全文）。
+        self.send_discord(full_message)
+        short_message = (
+            self.format_short_message(signals, breadth, pages_url=pages_url)
+            if pages_url
+            else full_message
+        )
+        self.send_line(short_message)
 
 
 # ============================================================================
-# 6. TradingSystem（全体オーケストレーション）
+# 6. ReportGenerator モジュール（GitHub Pages 用レポートHTML生成）
+# ----------------------------------------------------------------------------
+# 新高値ブレイクツールと同系統の「サイバーパンク調」デザインで、
+# メインカラーをシアン（水色）主体にした単一HTMLファイルを生成する。
+# 外部通信は Google Fonts のみで、それ以外は完全に自己完結している。
+# ============================================================================
+class ReportGenerator:
+    """スクリーニング結果を、GitHub Pagesで公開できる単一HTMLに整形するクラス。"""
+
+    _STRATEGY_BADGE = {
+        "A": ("逆張り買い", "buy"),
+        "B": ("押し目買い", "buy"),
+        "C": ("急騰株空売り", "sell"),
+        "D": ("下髭サポート買い", "buy"),
+    }
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        return (
+            str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def _render_card(self, s: dict) -> str:
+        side_label = "BUY / 買い" if s["side"] == "buy" else "SHORT / 空売り"
+        side_class = "side-buy" if s["side"] == "buy" else "side-sell"
+        warning_html = (
+            f'<p class="card-warning">⚠ {self._escape(s["warning"])}</p>'
+            if s.get("warning")
+            else ""
+        )
+        return f"""
+        <article class="card">
+          <div class="card-head">
+            <span class="ticker">{self._escape(s['ticker'])}</span>
+            <span class="side-badge {side_class}">{side_label}</span>
+          </div>
+          <h3 class="name">{self._escape(s['name'])}</h3>
+          <p class="strategy">戦略: {self._escape(s['strategy_label'])} (Strategy {self._escape(s['strategy_code'])})</p>
+          <dl class="metrics">
+            <div><dt>エントリー目安</dt><dd>{s['entry_price']:.1f} 円</dd></div>
+            <div><dt>損切り目安 (ATR×1.5)</dt><dd>{s['stop_loss']:.1f} 円</dd></div>
+            <div><dt>推奨株数</dt><dd>{s['max_shares']:,} 株</dd></div>
+            <div><dt>概算コスト</dt><dd>{s['estimated_cost']:,.0f} 円</dd></div>
+            <div><dt>想定リスク額</dt><dd>{s['risk_amount']:,.0f} 円</dd></div>
+            <div><dt>前日比</dt><dd>{s['pct_change']:+.2f} %</dd></div>
+          </dl>
+          {warning_html}
+        </article>
+        """
+
+    def build_html(
+        self,
+        signals: list[dict],
+        breadth: dict[str, float],
+        capital: float,
+        risk_pct: float,
+    ) -> str:
+        today_str = datetime.now().strftime("%Y-%m-%d (%a)")
+        cards_html = "\n".join(self._render_card(s) for s in signals)
+        if not signals:
+            cards_html = (
+                '<p class="empty-state">本日は条件を満たす候補銘柄がありません。'
+                "無理に売買しないこと。</p>"
+            )
+
+        ad_ratio = breadth["ad_ratio"]
+        # 騰落レシオを 0-200% のゲージにマッピング（100%を中央基準に）
+        gauge_pct = max(0.0, min(100.0, (ad_ratio / 200.0) * 100.0))
+        overheated = ad_ratio >= CONFIG.overheated_ad_ratio
+
+        return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>デイトレ候補レポート | {today_str}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --accent: #22e6ff;
+    --accent-soft: rgba(34, 230, 255, 0.07);
+    --accent-magenta: #ff3ec8;
+    --bg: #020305;
+    --panel: #060a12;
+    --panel-border: rgba(34, 230, 255, 0.15);
+    --border: rgba(34, 230, 255, 0.18);
+    --text: #c9edf5;
+    --text-dim: #5d7d87;
+    --danger: #ff4d6d;
+    --warn: #ffcc33;
+  }}
+  * {{ box-sizing: border-box; }}
+  html, body {{
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Share Tech Mono', 'Courier New', monospace;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }}
+  body {{
+    background-image:
+      radial-gradient(circle at 15% 8%, var(--accent-soft), transparent 38%),
+      radial-gradient(circle at 88% 0%, rgba(255,62,200,0.035), transparent 32%);
+  }}
+  .wrap {{ max-width: 1000px; margin: 0 auto; padding: 24px 16px 60px; }}
+  header {{ margin-bottom: 20px; }}
+  .title {{
+    font-size: 1.6rem;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    text-shadow: 0 0 6px rgba(34,230,255,0.35);
+    margin: 0 0 4px;
+  }}
+  .date {{ color: var(--text-dim); margin: 0; }}
+  .warning-banner {{
+    border: 1px solid var(--danger);
+    background: rgba(255, 77, 109, 0.08);
+    color: var(--danger);
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin: 16px 0 24px;
+    font-weight: bold;
+  }}
+  .breadth-panel {{
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 24px;
+  }}
+  .breadth-row {{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+  }}
+  .breadth-label {{ color: var(--text-dim); font-size: 0.85rem; }}
+  .breadth-value {{ color: var(--accent); font-size: 1.1rem; }}
+  .gauge {{
+    height: 8px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 4px;
+    margin-top: 10px;
+    overflow: hidden;
+  }}
+  .gauge-fill {{
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-magenta));
+    width: {gauge_pct:.1f}%;
+  }}
+  .overheated-tag {{
+    display: inline-block;
+    margin-top: 8px;
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+  }}
+  .grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 14px;
+  }}
+  .card {{
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 16px;
+    transition: border-color .2s;
+  }}
+  .card:hover {{ border-color: var(--accent); }}
+  .card-head {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }}
+  .ticker {{ color: var(--accent); font-weight: bold; letter-spacing: 0.05em; }}
+  .side-badge {{
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+  }}
+  .side-buy {{ color: var(--accent); }}
+  .side-sell {{ color: var(--accent-magenta); }}
+  .name {{ margin: 4px 0; font-size: 1.02rem; color: var(--text); }}
+  .strategy {{ color: var(--text-dim); font-size: 0.82rem; margin: 0 0 10px; }}
+  .metrics {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+    margin: 0;
+  }}
+  .metrics dt {{ color: var(--text-dim); font-size: 0.72rem; }}
+  .metrics dd {{ margin: 0; color: var(--text); font-size: 0.92rem; }}
+  .card-warning {{
+    margin: 10px 0 0;
+    color: var(--warn);
+    font-size: 0.78rem;
+  }}
+  .empty-state {{
+    color: var(--text-dim);
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    text-align: center;
+  }}
+  footer {{
+    margin-top: 32px;
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    text-align: center;
+  }}
+  @media (prefers-color-scheme: light) {{
+    :root {{ --bg: #05070d; --text: #d9f9ff; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="title">DAYTRADE SIGNAL REPORT</p>
+      <p class="date">{today_str}</p>
+    </header>
+
+    <div class="warning-banner">
+      ⚠ 全ポジション、当日大引け(15:00)までに手仕舞いすること。持ち越し厳禁。
+    </div>
+
+    <section class="breadth-panel">
+      <div class="breadth-row">
+        <span class="breadth-label">市場地合い（騰落レシオ）</span>
+        <span class="breadth-value">{ad_ratio:.1f}%</span>
+      </div>
+      <div class="gauge"><div class="gauge-fill"></div></div>
+      <div class="breadth-row" style="margin-top:8px;">
+        <span class="breadth-label">平均5日移動平均乖離率</span>
+        <span class="breadth-value">{breadth['avg_dev5']:.2f}%</span>
+      </div>
+      {'<span class="overheated-tag">買われすぎ：逆張り買い系シグナルを抑制中</span>' if overheated else ''}
+      <div class="breadth-row" style="margin-top:8px;">
+        <span class="breadth-label">総資金 / 許容リスク</span>
+        <span class="breadth-value">{capital:,.0f}円 / {risk_pct * 100:.1f}%</span>
+      </div>
+    </section>
+
+    <section class="grid">
+      {cards_html}
+    </section>
+
+    <footer>
+      本レポートは教育・研究目的のサンプル出力です。投資判断は自己責任で行ってください。<br>
+      Generated by daytrade_screener.py
+    </footer>
+  </div>
+</body>
+</html>
+"""
+
+    def save(self, html: str, path: str) -> None:
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(html, encoding="utf-8")
+        logger.info("レポートHTMLを出力しました: %s", out_path)
+
+
+# ============================================================================
+# 7. TradingSystem（全体オーケストレーション）
 # ============================================================================
 class TradingSystem:
     """
@@ -707,12 +1040,19 @@ class TradingSystem:
         risk_pct: float,
         cache_dir: str = "cache",
         names: Optional[dict[str, str]] = None,
+        report_path: Optional[str] = None,
+        pages_url: Optional[str] = None,
     ) -> None:
         self.tickers = tickers
         self.names = names or {}
+        self.capital = capital
+        self.risk_pct = risk_pct
+        self.report_path = report_path
+        self.pages_url = pages_url
         self.data_loader = DataLoader(tickers=tickers, cache_dir=cache_dir)
         self.screener = SignalScreener()
         self.risk_engine = RiskEngine(capital=capital, risk_pct=risk_pct)
+        self.report_generator = ReportGenerator()
 
     def run(self, dry_run: bool = False) -> list[dict]:
         logger.info("=== デイトレード・スクリーニング開始 ===")
@@ -741,13 +1081,20 @@ class TradingSystem:
         if skipped:
             logger.info("ポジションサイズ0のため通知から除外: %d 件", skipped)
 
-        # 5) 通知
+        # 5) レポートHTML生成（GitHub Pages公開用）
+        if self.report_path:
+            html = self.report_generator.build_html(
+                actionable, breadth, capital=self.capital, risk_pct=self.risk_pct
+            )
+            self.report_generator.save(html, self.report_path)
+
+        # 6) 通知（pages_url指定時はLINEに詳細ページへのリンクを添える）
         notifier = Notifier(
             discord_webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"),
             line_channel_access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"),
             line_user_id=os.environ.get("LINE_USER_ID"),
         )
-        notifier.notify(actionable, breadth, dry_run=dry_run)
+        notifier.notify(actionable, breadth, dry_run=dry_run, pages_url=self.pages_url)
 
         logger.info("=== デイトレード・スクリーニング終了 ===")
         return actionable
@@ -778,6 +1125,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tickers-file", type=str, default=None, help="銘柄コードCSVファイルのパス")
     parser.add_argument("--cache-dir", type=str, default="cache", help="キャッシュ保存先ディレクトリ")
     parser.add_argument("--dry-run", action="store_true", help="通知を送らずコンソール表示のみ行う")
+    parser.add_argument(
+        "--report-path",
+        type=str,
+        default="docs/index.html",
+        help="GitHub Pages公開用HTMLの出力先。空文字を指定するとレポート生成をスキップする。",
+    )
+    parser.add_argument(
+        "--pages-url",
+        type=str,
+        default=os.environ.get("PAGES_URL"),
+        help="公開済みGitHub PagesのURL。指定するとLINE通知が短い要約＋リンクになる。"
+        "環境変数 PAGES_URL からも取得可能。",
+    )
     return parser.parse_args()
 
 
@@ -800,6 +1160,8 @@ def main() -> None:
         capital=args.capital,
         risk_pct=args.risk_pct,
         cache_dir=args.cache_dir,
+        report_path=args.report_path or None,
+        pages_url=args.pages_url or None,
     )
     system.run(dry_run=args.dry_run)
 
