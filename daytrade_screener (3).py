@@ -921,7 +921,7 @@ class Notifier:
         else:
             lines.append("本日は該当銘柄なし。無理に売買しないこと。")
         lines.append(f"地合い(騰落レシオ): {breadth['ad_ratio']:.1f}%")
-        lines.append("※15:00までに全決済。")
+        lines.append("※15:30までに全決済。")
         if pages_url:
             lines.append(f"詳細: {pages_url}")
         return "\n".join(lines)
