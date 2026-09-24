@@ -1,7 +1,7 @@
 name: daytrade-screener
 on:
   schedule:
-    - cron: "30 16 * * 0-4"
+    - cron: "30 16 * * 1-5"
   workflow_dispatch: {}
 permissions:
   contents: write
