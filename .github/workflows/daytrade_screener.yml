@@ -1,29 +1,68 @@
-name: daytrade-screener
+name: Daytrade Screener v2
+
 on:
   schedule:
-    - cron: "30 16 * * 1-5"
-  workflow_dispatch: {}
+    # UTC 日〜木22:30 = 日本時間 月〜金07:30（祝日はPython側で判定）
+    - cron: '30 22 * * 0-4'
+  workflow_dispatch:
+
 permissions:
   contents: write
+
+concurrency:
+  group: daytrade-report-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  run:
+  daytrade:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout main repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: pip install pandas numpy yfinance requests
-      - run: python daytrade_screener.py --capital 1000000 --tickers-file tse_tickers_trimmed.csv
+          python-version: '3.11'
+
+      - name: Write dependency list
+        run: |
+          printf '%s\n' 'numpy>=1.26' 'pandas>=2.1' 'yfinance>=0.2.50' 'requests>=2.31' 'exchange_calendars>=4.0' 'openpyxl>=3.1' 'xlrd>=2.0' > requirements-daytrade.txt
+
+      - name: Install free Python packages
+        run: python -m pip install -r requirements-daytrade.txt
+
+      - name: Restore cached daily prices
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: daytrade-price-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            daytrade-price-${{ runner.os }}-
+
+      - name: Update 200-issue universe in manageable batches
+        # JPX has a free monthly listed-issues sheet; failures here won't disable existing screening.
+        continue-on-error: true
+        run: python daytrade_screener.py --build-universe --universe-batch-size 80
+
+      - name: Screen with current CSV (or sample until the CSV is ready)
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
-          PAGES_URL: "https://cafemarlsurf727-cell.github.io/daytrade-screener/"
-      - name: レポートHTMLをコミット
+          PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+        run: python daytrade_screener.py --capital 1000000 --risk-pct 0.01
+
+      - name: Save report, result log, and universe scan progress
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/index.html
-          git diff --staged --quiet || git commit -m "chore: update daytrade report"
-          git push
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          for f in docs/index.html logs/signal_log.csv universe/universe_metrics.csv tickers_200.csv; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
+          if ! git diff --staged --quiet; then
+            git commit -m 'chore: update daytrade v2 research results'
+            git pull --rebase
+            git push
+          fi
