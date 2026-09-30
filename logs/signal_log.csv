@@ -1,0 +1,1 @@
+signal_date,as_of_date,ticker,name,strategy_code,matched_strategies,strategy_label,side,entry_price,stop_loss,max_shares,estimated_cost,risk_amount,ad_ratio,model_version,status,actual_open,actual_high,actual_low,actual_close,modeled_entry,modeled_shares,stopped_out,exit_price,gap_pct,pnl_per_share,pnl_total,r_multiple,resolved_at,skip_reason
