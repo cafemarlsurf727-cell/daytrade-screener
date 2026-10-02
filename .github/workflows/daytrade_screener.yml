@@ -3,7 +3,7 @@ name: Daytrade Screener v2
 on:
   schedule:
     # UTC 日〜木22:30 = 日本時間 月〜金07:30（祝日はPython側で判定）
-    - cron: '30 22 * * 0-4'
+    - cron: '00 17 * * 0-4'
   workflow_dispatch:
 
 permissions:
