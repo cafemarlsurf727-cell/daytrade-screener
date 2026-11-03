@@ -647,15 +647,20 @@ class RiskEngine:
         shortable_tickers = shortable_tickers or set()
         seen_tickers = set()
         for s in enriched:
+            s["allocation_reason"] = None
             if s["ticker"] in seen_tickers:
+                s["allocation_reason"] = "同一銘柄の重複"
                 continue
             if len(selected) >= max_positions:
-                break
+                s["allocation_reason"] = f"最大同時ポジション数{max_positions}件に到達"
+                continue
             if s["side"] == "sell" and s["ticker"] not in shortable_tickers:
+                s["allocation_reason"] = "当日の空売り在庫・規制が未確認（研究候補のみ）"
                 logger.warning("空売り在庫未確認につき研究候補のみ（割当対象外）: %s", s["ticker"])
                 continue
             per_share_risk = abs(s["entry_price"] - s["stop_loss"])
             if per_share_risk <= 0:
+                s["allocation_reason"] = "損切り幅が0以下"
                 continue
             unit = self.config.unit_shares
             shares_by_risk = int(min(self.capital * self.risk_pct, remaining_risk)
@@ -664,6 +669,12 @@ class RiskEngine:
             shares_by_cash = int(remaining_cash // (s["entry_price"] * unit)) * unit
             shares = min(shares_by_risk, shares_by_cash)
             if shares < unit:
+                reasons = []
+                if shares_by_risk < unit:
+                    reasons.append("許容損失・残リスク内で100株単元を確保できない")
+                if shares_by_cash < unit:
+                    reasons.append("資金余力内で100株単元を確保できない")
+                s["allocation_reason"] = " / ".join(reasons) or "単元株を確保できない"
                 continue
             item = dict(s)
             item.update(max_shares=shares, max_lots=shares // unit,
@@ -686,6 +697,29 @@ class RiskEngine:
 
 
 # ============================================================================
+
+def build_display_candidates(enriched, actionable):
+    """条件一致した銘柄は配分不可でもゼロ株の参考候補として表示する。"""
+    allocated = {item["ticker"]: item for item in actionable}
+    displayed = []
+    for signal in enriched:
+        if signal["ticker"] in allocated:
+            candidate = dict(allocated[signal["ticker"]])
+            candidate["allocation_status"] = "allocated"
+        else:
+            candidate = dict(signal)
+            candidate.update(
+                allocation_status="research_only",
+                max_shares=0, max_lots=0, estimated_cost=0, risk_amount=0,
+                warning="資金配分対象外（参考候補のみ）: " +
+                        (signal.get("allocation_reason") or "資金管理条件を満たさない"),
+            )
+            logger.info("参考候補 %s (%s): %s", candidate["ticker"],
+                        candidate["strategy_code"], candidate["warning"])
+        displayed.append(candidate)
+    return displayed
+
+
 # 5. SignalLogger モジュール（検証運用：シグナルの記録と答え合わせ）
 # ----------------------------------------------------------------------------
 # 「シグナルを出す」だけでなく「そのシグナルが実際どうなったか」を
@@ -901,8 +935,11 @@ class Notifier:
 
         for s in signals:
             side_label = "買い" if s["side"] == "buy" else "空売り"
+            status = ("参考候補（資金配分なし）" if s.get("allocation_status") == "research_only"
+                      else "資金配分候補（発注前の再確認が必要）")
             lines.append(
                 f"■ {s['name']} ({s['ticker']}) [{s['strategy_label']} / {side_label}]\n"
+                f"  判定: {status}\n"
                 f"  前日終値（判定基準）: {s['entry_price']:.1f}円\n"
                 f"  損切り目安    : {s['stop_loss']:.1f}円 (ATR×{s.get('atr_multiplier', 1.5):.1f})\n"
                 f"  参考株数      : {s['max_shares']}株"
@@ -975,10 +1012,12 @@ class Notifier:
         today_str = datetime.now(JST).strftime("%Y-%m-%d")
         buy_count = sum(1 for s in signals if s["side"] == "buy")
         sell_count = sum(1 for s in signals if s["side"] == "sell")
+        research_count = sum(1 for s in signals if s.get("allocation_status") == "research_only")
 
         lines = [f"【デイトレ候補】{today_str}"]
         if signals:
             lines.append(f"検出 {len(signals)}件（買い{buy_count} / 空売り{sell_count}）")
+            lines.append(f"資金配分候補{len(signals) - research_count}件 / 参考のみ{research_count}件")
         else:
             lines.append("本日は該当銘柄なし。無理に売買しないこと。")
         lines.append(f"市場騰落レシオ: {breadth['ad_ratio']:.1f}%" if breadth.get("ad_ratio") is not None else "市場騰落レシオ: 未設定")
@@ -1048,6 +1087,8 @@ class ReportGenerator:
             if s.get("warning")
             else ""
         )
+        status = ("参考候補（資金配分なし）" if s.get("allocation_status") == "research_only"
+                  else "資金配分候補（発注前の確認が必要）")
         return f"""
         <article class="card">
           <div class="card-head">
@@ -1056,6 +1097,7 @@ class ReportGenerator:
           </div>
           <h3 class="name">{self._escape(s['name'])}</h3>
           <p class="strategy">戦略: {self._escape(s['strategy_label'])} (Strategy {self._escape(s['strategy_code'])})</p>
+          <p class="card-warning">判定: {self._escape(status)}</p>
           <dl class="metrics">
             <div><dt>前日終値（判定基準）</dt><dd>{s['entry_price']:.1f} 円</dd></div>
             <div><dt>損切り目安 (ATR×{s.get('atr_multiplier', 1.5):.1f})</dt><dd>{s['stop_loss']:.1f} 円</dd></div>
@@ -1113,6 +1155,7 @@ class ReportGenerator:
         capital: float,
         risk_pct: float,
         stats: Optional[dict] = None,
+        screened_count: Optional[int] = None,
     ) -> str:
         today_str = datetime.now(JST).strftime("%Y-%m-%d (%a)")
         cards_html = "\n".join(self._render_card(s) for s in signals)
@@ -1130,6 +1173,12 @@ class ReportGenerator:
         overheated = ad_ratio is not None and ad_ratio >= CONFIG.overheated_ad_ratio
 
         ad_display = f"{ad_ratio:.1f}%" if ad_ratio is not None else "未設定・判定無効"
+        research_count = sum(1 for item in signals
+                             if item.get("allocation_status") == "research_only")
+        summary = (f"判定対象 {screened_count}銘柄 / " if screened_count is not None else "") + (
+            f"条件一致 {len(signals)}銘柄 / 資金配分候補 {len(signals) - research_count}銘柄 / "
+            f"参考のみ {research_count}銘柄"
+        )
         return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1330,6 +1379,14 @@ class ReportGenerator:
       </div>
     </section>
 
+    <section class="breadth-panel">
+      <p class="breadth-value">{summary}</p>
+      <p class="breadth-label" style="margin-top:8px;">
+        参考候補は売買推奨ではありません。資金管理・空売り在庫等の条件を満たさず、
+        参考株数は0株としています。
+      </p>
+    </section>
+
     {stats_html}
 
     <section class="grid">
@@ -1409,6 +1466,9 @@ class TradingSystem:
         actionable = self.risk_engine.allocate_portfolio(
             enriched, max_positions=self.max_positions,
             portfolio_risk_pct=self.portfolio_risk_pct, shortable_tickers=shortable)
+        displayed = build_display_candidates(enriched, actionable)
+        logger.info("判定対象 %d銘柄 / 条件一致 %d銘柄 / 配分可能 %d銘柄 / 参考のみ %d銘柄",
+                    len(data), len(displayed), len(actionable), len(displayed) - len(actionable))
         stats = None
         if self.signal_logger:
             log_df = self.signal_logger.resolve(existing_log, all_data)
@@ -1418,13 +1478,14 @@ class TradingSystem:
             stats = self.signal_logger.summarize(log_df)
         if self.report_path:
             html = self.report_generator.build_html(
-                actionable, breadth, capital=self.capital, risk_pct=self.risk_pct, stats=stats)
+                displayed, breadth, capital=self.capital, risk_pct=self.risk_pct,
+                stats=stats, screened_count=len(data))
             self.report_generator.save(html, self.report_path)
         notifier = Notifier(
             discord_webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"),
             line_channel_access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"),
             line_user_id=os.environ.get("LINE_USER_ID"))
-        notifier.notify(actionable, breadth, dry_run=dry_run, pages_url=self.pages_url)
+        notifier.notify(displayed, breadth, dry_run=dry_run, pages_url=self.pages_url)
         logger.info("=== 処理完了：選定%d、通知候補%d ===", len(data), len(actionable))
         return actionable
 
@@ -1547,6 +1608,56 @@ def compute_universe_metrics(ticker, df, meta, capital):
                 last_bar=df.index[-1].date().isoformat())
 
 
+
+def eligible_universe(state):
+    """銘柄調査結果から既存の適格基準に合う銘柄を抽出する。"""
+    if state.empty:
+        return state.copy()
+    eligible = state.copy()
+    for col in ("avg_turnover20", "atr_pct", "buy_signal_days", "short_signal_days"):
+        values = eligible[col] if col in eligible.columns else pd.Series(0, index=eligible.index)
+        eligible[col] = pd.to_numeric(values, errors="coerce").fillna(0)
+    return eligible[(eligible["avg_turnover20"] >= 300_000_000) &
+                    (eligible["atr_pct"].between(2, 8))].copy()
+
+
+def select_universe_candidates(eligible, shortable_file=None):
+    """正式版と暫定版で同じ順位付けを使用する。"""
+    if eligible.empty:
+        return eligible.head(0).copy()
+    buys = eligible.sort_values(["buy_signal_days", "avg_turnover20"], ascending=False)
+    shortables = (set(load_tickers_from_csv(shortable_file))
+                  if shortable_file and Path(shortable_file).exists() else set())
+    shorts = (eligible[eligible["ticker"].isin(shortables)]
+              .sort_values(["short_signal_days", "avg_turnover20"], ascending=False))
+    buy_quota = 150 if len(shorts) >= 50 else 200
+    selected = pd.concat([buys.head(buy_quota), shorts.head(50)]).drop_duplicates("ticker")
+    if len(selected) < 200:
+        extra = buys[~buys["ticker"].isin(selected["ticker"])]
+        selected = pd.concat([selected, extra.head(200 - len(selected))])
+    return selected.head(200).copy()
+
+
+def load_provisional_tickers(state_file, shortable_file=None):
+    """200銘柄未完成でも、調査済み適格銘柄を暫定利用する。"""
+    path = Path(state_file)
+    if not path.is_file():
+        return [], {}
+    try:
+        state = pd.read_csv(path, dtype={"ticker": str})
+        if not {"ticker", "avg_turnover20", "atr_pct"}.issubset(state.columns):
+            raise ValueError("必要な銘柄調査列が欠けています")
+        selected = select_universe_candidates(eligible_universe(state), shortable_file)
+        selected["ticker"] = selected["ticker"].map(normalize_ticker)
+        selected = selected.dropna(subset=["ticker"]).drop_duplicates("ticker")
+        names = (dict(zip(selected["ticker"], selected["name"].fillna(selected["ticker"])))
+                 if "name" in selected.columns else {})
+        return selected["ticker"].tolist(), names
+    except (OSError, ValueError, pd.errors.ParserError, KeyError) as exc:
+        logger.warning("暫定銘柄リストを利用できません: %s", exc)
+        return [], {}
+
+
 def build_universe(jpx_file=None, cache_dir="cache", state_file="universe/universe_metrics.csv",
                    output_file="tickers_200.csv", batch_size=80, capital=1_000_000,
                    shortable_file=None):
@@ -1591,22 +1702,8 @@ def build_universe(jpx_file=None, cache_dir="cache", state_file="universe/univer
         state = state[~state["ticker"].isin(tickers)]
     state = pd.concat([state, fresh], ignore_index=True).drop_duplicates("ticker", keep="last")
     state.to_csv(state_path, index=False)
-    eligible = state[(state["avg_turnover20"] >= 300_000_000) &
-                     (state["atr_pct"].between(2, 8))].copy()
-    eligible["buy_signal_days"] = pd.to_numeric(eligible["buy_signal_days"], errors="coerce").fillna(0)
-    eligible["short_signal_days"] = pd.to_numeric(eligible["short_signal_days"], errors="coerce").fillna(0)
-    eligible["avg_turnover20"] = pd.to_numeric(eligible["avg_turnover20"], errors="coerce").fillna(0)
-    buys = eligible.sort_values(["buy_signal_days", "avg_turnover20"], ascending=False)
-    shortables = (set(load_tickers_from_csv(shortable_file))
-                  if shortable_file and Path(shortable_file).exists() else set())
-    shorts = (eligible[eligible["ticker"].isin(shortables)]
-              .sort_values(["short_signal_days", "avg_turnover20"], ascending=False))
-    buy_quota = 150 if len(shorts) >= 50 else 200
-    selected = pd.concat([buys.head(buy_quota), shorts.head(50)]).drop_duplicates("ticker")
-    if len(selected) < 200:
-        extra = buys[~buys["ticker"].isin(selected["ticker"])]
-        selected = pd.concat([selected, extra.head(200 - len(selected))])
-    selected = selected.head(200)
+    eligible = eligible_universe(state)
+    selected = select_universe_candidates(eligible, shortable_file)
     logger.info("条件適合 %d銘柄 / 暫定選定 %d銘柄 / 全市場進捗 %d/%d",
                 len(eligible), len(selected), len(state), len(options))
     if len(selected) >= 200:
@@ -1667,8 +1764,12 @@ def main():
         tickers, names = load_selected_tickers(chosen_file)
         logger.info("CSVから %d 銘柄: %s", len(tickers), chosen_file)
     else:
-        tickers, names = list(dict.fromkeys(DEFAULT_TICKERS)), {}
-        logger.warning("200銘柄CSV未作成。内蔵のサンプル %d 銘柄を使います", len(tickers))
+        tickers, names = load_provisional_tickers(args.universe_state, args.shortable_file)
+        if tickers:
+            logger.warning("200銘柄CSV未作成。調査済み適格 %d 銘柄を暫定利用します", len(tickers))
+        else:
+            tickers, names = list(dict.fromkeys(DEFAULT_TICKERS)), {}
+            logger.warning("利用可能な調査済み銘柄なし。内蔵サンプル %d 銘柄を使用", len(tickers))
     if not tickers:
         raise ValueError("対象銘柄が0件です。CSVを確認してください")
     system = TradingSystem(
