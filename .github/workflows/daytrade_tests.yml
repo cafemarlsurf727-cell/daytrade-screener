@@ -1,0 +1,30 @@
+name: Daytrade regression tests
+
+on:
+  pull_request:
+    paths:
+      - 'daytrade_screener.py'
+      - 'tests/**'
+      - '.github/workflows/daytrade_tests.yml'
+  push:
+    paths:
+      - 'daytrade_screener.py'
+      - 'tests/**'
+      - '.github/workflows/daytrade_tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install "numpy>=1.26" "pandas>=2.1" "yfinance>=0.2.50" "requests>=2.31"
+      - name: Run regression tests without live prices or notifications
+        run: python -m unittest discover -s tests -v
