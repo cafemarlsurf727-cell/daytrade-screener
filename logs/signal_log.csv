@@ -1,2 +1,5 @@
 signal_date,as_of_date,ticker,name,strategy_code,matched_strategies,strategy_label,side,entry_price,stop_loss,max_shares,estimated_cost,risk_amount,ad_ratio,model_version,status,actual_open,actual_high,actual_low,actual_close,modeled_entry,modeled_shares,stopped_out,exit_price,gap_pct,pnl_per_share,pnl_total,r_multiple,resolved_at,skip_reason
-2026-11-04,2026-11-02,4005.T,住友化学,A,A,逆張り買い,buy,511.5,477.5,200,102300.0,6800.0,,v2-open-slippage,pending,,,,,,,,,,,,,,
+2026-11-04,2026-11-02,4005.T,住友化学,A,A,逆張り買い,buy,511.5,477.5,200,102300.0,6800.0,,v2-open-slippage,resolved,521.0,526.9000244140625,502.0,521.7000122070312,521.521,100,False,521.1783121948242,1.8572825024437911,-0.3426878051757285,-34.26878051757285,-0.00787788057875238,2026-11-05T07:31:08+09:00,
+2026-11-05,2026-11-04,4597.T,ソレイジア・ファーマ,A,A,逆張り買い,buy,25.0,22.4,3800,95000.0,9880.0,,v2-open-slippage,pending,,,,,,,,,,,,,,
+2026-11-05,2026-11-04,3083.T,スターシーズ,A,A,逆張り買い,buy,950.0,895.8,100,95000.0,5420.0,,v2-open-slippage,pending,,,,,,,,,,,,,,
+2026-11-05,2026-11-04,6632.T,ＪＶＣケンウッド,A,A,逆張り買い,buy,835.0,792.7,200,167000.0,8460.0,,v2-open-slippage,pending,,,,,,,,,,,,,,
