@@ -48,6 +48,8 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from research_journal import ResearchSignalJournal, render_research_stats_html
+
 # ============================================================================
 # ロギング設定
 # ============================================================================
@@ -1114,7 +1116,7 @@ class ReportGenerator:
         if not stats or not stats.get("overall"):
             return """
         <section class="breadth-panel">
-          <p class="breadth-label">検証実績（答え合わせ済みシグナル）</p>
+          <p class="breadth-label">資金配分候補の仮想検証（全候補とは別集計）</p>
           <p class="empty-state" style="padding:12px;">
             まだ答え合わせ済みのシグナルがありません。運用を続けると翌営業日以降、
             自動的にここに勝率・平均R倍数が蓄積されます。
@@ -1136,7 +1138,7 @@ class ReportGenerator:
         return f"""
         <section class="breadth-panel">
           <div class="breadth-row">
-            <span class="breadth-label">検証実績（答え合わせ済み全体）</span>
+            <span class="breadth-label">資金配分候補の仮想検証（全候補とは別集計）</span>
             <span class="breadth-value">
               仮想勝率 {overall['win_rate']:.0f}% / 平均R {overall['avg_r']:+.2f} / n={overall['n']}
             </span>
@@ -1156,6 +1158,7 @@ class ReportGenerator:
         risk_pct: float,
         stats: Optional[dict] = None,
         screened_count: Optional[int] = None,
+        research_stats: Optional[dict] = None,
     ) -> str:
         today_str = datetime.now(JST).strftime("%Y-%m-%d (%a)")
         cards_html = "\n".join(self._render_card(s) for s in signals)
@@ -1179,6 +1182,7 @@ class ReportGenerator:
             f"条件一致 {len(signals)}銘柄 / 資金配分候補 {len(signals) - research_count}銘柄 / "
             f"参考のみ {research_count}銘柄"
         )
+        research_stats_html = render_research_stats_html(research_stats)
         return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1387,6 +1391,7 @@ class ReportGenerator:
       </p>
     </section>
 
+    {research_stats_html}
     {stats_html}
 
     <section class="grid">
@@ -1417,7 +1422,8 @@ class TradingSystem:
                  report_path="docs/index.html", pages_url=None, log_path="logs/signal_log.csv",
                  breadth_file=None, shortable_file=None, max_positions=3,
                  portfolio_risk_pct=0.03, min_coverage=0.90,
-                 max_gap_pct=5.0, slippage_pct=0.001):
+                 max_gap_pct=5.0, slippage_pct=0.001,
+                 research_log_path=None):
         self.tickers = list(dict.fromkeys(tickers))
         self.names = names or {}
         self.capital = capital
@@ -1435,6 +1441,11 @@ class TradingSystem:
         self.report_generator = ReportGenerator()
         self.signal_logger = (SignalLogger(log_path=log_path, max_gap_pct=max_gap_pct,
                                            slippage_pct=slippage_pct) if log_path else None)
+        self.research_logger = (
+            ResearchSignalJournal(research_log_path, max_gap_pct=max_gap_pct,
+                                  slippage_pct=slippage_pct)
+            if research_log_path else None
+        )
 
     def run(self, dry_run=False):
         logger.info("=== デイトレ v2 開始、対象%d銘柄 ===", len(self.tickers))
@@ -1442,10 +1453,14 @@ class TradingSystem:
             logger.info("東証休場のため本日の新規通知はスキップします")
             return []
         existing_log = self.signal_logger.load() if self.signal_logger else None
+        existing_research = self.research_logger.load() if self.research_logger else None
         pending = []
-        if existing_log is not None and not existing_log.empty:
-            pending = existing_log.loc[existing_log["status"] == "pending", "ticker"].dropna().tolist()
-        # 過去ログにしかいない銘柄も答え合わせ用に価格を再取得する。
+        for ledger in (existing_log, existing_research):
+            if ledger is not None and not ledger.empty:
+                pending.extend(
+                    ledger.loc[ledger["status"] == "pending", "ticker"].dropna().tolist()
+                )
+        # 対象銘柄リストから外れた過去の研究候補も答え合わせ用に価格を取得する。
         full_tickers = list(dict.fromkeys(self.tickers + pending))
         self.data_loader = DataLoader(full_tickers, cache_dir=str(self.data_loader.cache_dir.parent))
         all_data = self.data_loader.fetch_all()
@@ -1469,6 +1484,18 @@ class TradingSystem:
         displayed = build_display_candidates(enriched, actionable)
         logger.info("判定対象 %d銘柄 / 条件一致 %d銘柄 / 配分可能 %d銘柄 / 参考のみ %d銘柄",
                     len(data), len(displayed), len(actionable), len(displayed) - len(actionable))
+        research_stats = None
+        if self.research_logger:
+            research_df, resolved = self.research_logger.resolve(existing_research, all_data)
+            research_df, added = self.research_logger.append(
+                research_df, displayed, today_jst().isoformat(), previous_session()
+            )
+            self.research_logger.save(research_df)
+            research_stats = self.research_logger.summarize(research_df)
+            logger.info("全候補研究ログ: 新規%d、答え合わせ%d、検証済み計%d、判定待ち%d、見送り%d",
+                        added, resolved, research_stats["counts"]["resolved"],
+                        research_stats["counts"]["pending"],
+                        research_stats["counts"]["skipped"])
         stats = None
         if self.signal_logger:
             log_df = self.signal_logger.resolve(existing_log, all_data)
@@ -1479,7 +1506,7 @@ class TradingSystem:
         if self.report_path:
             html = self.report_generator.build_html(
                 displayed, breadth, capital=self.capital, risk_pct=self.risk_pct,
-                stats=stats, screened_count=len(data))
+                stats=stats, screened_count=len(data), research_stats=research_stats)
             self.report_generator.save(html, self.report_path)
         notifier = Notifier(
             discord_webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"),
@@ -1732,6 +1759,9 @@ def parse_args():
     parser.add_argument("--report-path", type=str, default="docs/index.html")
     parser.add_argument("--pages-url", type=str, default=os.environ.get("PAGES_URL"))
     parser.add_argument("--log-path", type=str, default="logs/signal_log.csv")
+    parser.add_argument("--research-log-path", type=str,
+                        default="logs/research_signal_log.csv",
+                        help="全シグナルの資金額と独立した研究用成績CSV")
     parser.add_argument("--build-universe", action="store_true", help="JPXから200銘柄を分割自動選定")
     parser.add_argument("--jpx-file", type=str, default=None, help="公式JPX一覧のxls/xlsx/csv")
     parser.add_argument("--universe-batch-size", type=int, default=80)
@@ -1779,7 +1809,8 @@ def main():
         breadth_file=args.breadth_file, shortable_file=args.shortable_file,
         max_positions=args.max_positions, portfolio_risk_pct=args.portfolio_risk_pct,
         min_coverage=args.min_coverage, max_gap_pct=args.max_gap_pct,
-        slippage_pct=args.slippage_pct)
+        slippage_pct=args.slippage_pct,
+        research_log_path=args.research_log_path)
     system.run(dry_run=args.dry_run)
 
 
