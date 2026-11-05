@@ -58,7 +58,7 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          for f in docs/index.html logs/signal_log.csv universe/universe_metrics.csv tickers_200.csv; do
+          for f in docs/index.html logs/signal_log.csv logs/research_signal_log.csv universe/universe_metrics.csv tickers_200.csv; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           if ! git diff --staged --quiet; then
