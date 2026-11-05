@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       - 'daytrade_screener.py'
+      - 'research_journal.py'
       - 'tests/**'
       - '.github/workflows/daytrade_tests.yml'
   push:
     paths:
       - 'daytrade_screener.py'
+      - 'research_journal.py'
       - 'tests/**'
       - '.github/workflows/daytrade_tests.yml'
 
