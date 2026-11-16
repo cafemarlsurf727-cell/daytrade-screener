@@ -157,7 +157,9 @@ class TradingIntegrationTests(unittest.TestCase):
         )
 
     def test_rejected_signal_recorded_without_changing_portfolio_ledger(self):
-        with patch.object(ds, "is_trading_day", return_value=True), \
+        with patch.object(ds, "today_jst", return_value=date(2026, 10, 30)), \
+             patch.object(ds, "is_after_tse_close", return_value=True), \
+             patch.object(ds, "is_trading_day", return_value=True), \
              patch.object(ds.DataLoader, "fetch_all",
                           return_value={"1111.T": price_history()}), \
              patch.object(ds.Notifier, "notify"):
@@ -188,7 +190,9 @@ class TradingIntegrationTests(unittest.TestCase):
                 "2222.T": one_bar("2026-10-30", 101, 108, 99, 107),
             }
 
-        with patch.object(ds, "is_trading_day", return_value=True), \
+        with patch.object(ds, "today_jst", return_value=date(2026, 10, 30)), \
+             patch.object(ds, "is_after_tse_close", return_value=True), \
+             patch.object(ds, "is_trading_day", return_value=True), \
              patch.object(ds.DataLoader, "fetch_all", fetch_prices), \
              patch.object(ds.Notifier, "notify"):
             self.trading().run(dry_run=True)
@@ -205,7 +209,9 @@ class TradingIntegrationTests(unittest.TestCase):
             "2026-10-30", "2026-10-29")
         journal.save(prior)
         original = self.research.read_bytes()
-        with patch.object(ds, "is_trading_day", return_value=True), \
+        with patch.object(ds, "today_jst", return_value=date(2026, 10, 30)), \
+             patch.object(ds, "is_after_tse_close", return_value=True), \
+             patch.object(ds, "is_trading_day", return_value=True), \
              patch.object(ds.DataLoader, "fetch_all", return_value={}):
             self.assertEqual(self.trading().run(dry_run=True), [])
         self.assertEqual(self.research.read_bytes(), original)

@@ -67,8 +67,22 @@ MODEL_VERSION = "v2-open-slippage"
 EXIT_GUIDE = "15:25までに手仕舞い判断・注文を完了（15:30の大引けに依存しない）"
 
 
+def now_jst():
+    return datetime.now(JST)
+
+
 def today_jst():
-    return datetime.now(JST).date()
+    return now_jst().date()
+
+
+def is_after_tse_close(now=None):
+    """東証の現物取引終了（15:30 JST）前は確定日足を扱わない。"""
+    now = now or now_jst()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=JST)
+    else:
+        now = now.astimezone(JST)
+    return (now.hour, now.minute, now.second) >= (15, 30, 0)
 
 
 def previous_session(day=None):
@@ -88,6 +102,23 @@ def previous_session(day=None):
         if d.weekday() < 5:
             return d
     raise ValueError("前営業日を特定できません")
+
+
+def next_session(day):
+    """指定日の次に来る東証立会日。祝日・年末年始はXTKSカレンダーで判定。"""
+    try:
+        import exchange_calendars as xcals
+        calendar = xcals.get_calendar("XTKS")
+    except (ImportError, ValueError, KeyError) as exc:
+        raise RuntimeError("東証カレンダーを利用できないため候補日を特定できません") from exc
+    for offset in range(1, 32):
+        candidate = day + timedelta(days=offset)
+        try:
+            if calendar.is_session(pd.Timestamp(candidate)):
+                return candidate
+        except (ValueError, KeyError) as exc:
+            raise RuntimeError(f"東証カレンダーで日付を判定できません: {candidate}") from exc
+    raise ValueError(f"次の東証立会日を特定できません: {day}")
 
 
 def is_trading_day(day=None):
@@ -177,7 +208,7 @@ CONFIG = StrategyConfig()
 # ============================================================================
 class DataLoader:
     def __init__(self, tickers, cache_dir="cache", period="1y", batch_size=25,
-                 max_retries=2, retry_wait_sec=3.0):
+                 max_retries=2, retry_wait_sec=3.0, as_of_date=None):
         self.tickers = list(dict.fromkeys(tickers))
         self.cache_dir = Path(cache_dir) / "tickers"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -185,8 +216,9 @@ class DataLoader:
         self.batch_size = batch_size
         self.max_retries = max_retries
         self.retry_wait_sec = retry_wait_sec
-        self.expected_day = previous_session()
+        self.expected_day = as_of_date or today_jst()
         self.failed = []
+        self.refreshed = set()
 
     def _cache_path(self, ticker):
         if not re.fullmatch(r"[A-Z0-9.\-]+", ticker):
@@ -194,7 +226,7 @@ class DataLoader:
         return self.cache_dir / f"{ticker}.csv"
 
     @staticmethod
-    def normalize(df):
+    def normalize(df, as_of_date=None):
         if df is None or df.empty:
             return pd.DataFrame()
         out = df.copy()
@@ -212,7 +244,8 @@ class DataLoader:
             out[col] = pd.to_numeric(out[col], errors="coerce")
         out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=cols[:4])
         out = out[(out["Close"] > 0) & (out["Volume"] >= 0)]
-        out = out.loc[out.index.date < today_jst()]  # 当日未確定足を絶対に使わない
+        cutoff = as_of_date or today_jst()
+        out = out.loc[out.index.date <= cutoff]
         return out.loc[~out.index.duplicated(keep="last")].sort_index().tail(320)
 
     def _read_cache(self, ticker):
@@ -220,7 +253,7 @@ class DataLoader:
         if not path.exists():
             return pd.DataFrame()
         try:
-            return self.normalize(pd.read_csv(path, index_col=0, parse_dates=True))
+            return self.normalize(pd.read_csv(path, index_col=0, parse_dates=True), self.expected_day)
         except Exception as exc:
             logger.warning("キャッシュ破損 %s: %s", ticker, exc)
             return pd.DataFrame()
@@ -248,7 +281,7 @@ class DataLoader:
             params["period"] = period or self.period  # 期間指定時はendと併用しない
         else:
             params["start"] = start
-            params["end"] = today_jst().isoformat()  # endは排他的
+            params["end"] = (self.expected_day + timedelta(days=1)).isoformat()  # endは排他的
         return yf.download(**params)
 
     def _collect_batches(self, tickers, result, *, incremental=False):
@@ -271,36 +304,54 @@ class DataLoader:
                     time.sleep(self.retry_wait_sec * (attempt + 1))
             for ticker in batch:
                 raw = self._unpack(fresh, ticker, len(batch))
-                normalized = self.normalize(raw)
+                normalized = self.normalize(raw, self.expected_day)
                 if normalized.empty:
                     logger.warning("株価未取得: %s（キャッシュがあれば保持）", ticker)
                     continue
+                fresh_bar_confirmed = (
+                    normalized.index[-1].date() == self.expected_day and
+                    self._valid_bar(normalized.iloc[-1])
+                )
                 old = result.get(ticker, pd.DataFrame())
-                merged = self.normalize(pd.concat([old, normalized])) if not old.empty else normalized
-                if len(merged) >= 15:
+                merged = self.normalize(pd.concat([old, normalized]), self.expected_day) if not old.empty else normalized
+                if (len(merged) >= 15 and merged.index[-1].date() == self.expected_day
+                        and self._valid_bar(merged.iloc[-1]) and fresh_bar_confirmed):
                     result[ticker] = merged
                     self._save_cache(ticker, merged)
+                    self.refreshed.add(ticker)
             failed_batch = [t for t in batch if t not in result or
-                            result[t].index[-1].date() < self.expected_day]
+                            result[t].index[-1].date() < self.expected_day or
+                            t not in self.refreshed]
             # 1-4銘柄だけ欠損なら個別で再試行。大量欠損時はレート制限を疑い連打しない。
             if 0 < len(failed_batch) <= 4:
                 for ticker in failed_batch:
                     try:
                         time.sleep(self.retry_wait_sec)
                         extra = self._download([ticker], start=start)
-                        normalized = self.normalize(self._unpack(extra, ticker, 1))
+                        normalized = self.normalize(self._unpack(extra, ticker, 1), self.expected_day)
                         if not normalized.empty:
+                            fresh_bar_confirmed = (
+                                normalized.index[-1].date() == self.expected_day and
+                                self._valid_bar(normalized.iloc[-1])
+                            )
                             old = result.get(ticker, pd.DataFrame())
-                            merged = self.normalize(pd.concat([old, normalized])) if not old.empty else normalized
-                            if len(merged) >= 15:
+                            merged = self.normalize(pd.concat([old, normalized]), self.expected_day) if not old.empty else normalized
+                            if (len(merged) >= 15 and merged.index[-1].date() == self.expected_day
+                                    and self._valid_bar(merged.iloc[-1]) and fresh_bar_confirmed):
                                 result[ticker] = merged
                                 self._save_cache(ticker, merged)
+                                self.refreshed.add(ticker)
                     except Exception as exc:
                         logger.warning("個別再取得失敗 %s: %s", ticker, exc)
             if i + self.batch_size < len(tickers):
                 time.sleep(0.7)
 
     def fetch_all(self):
+        self.refreshed = set()
+        if self.expected_day == today_jst() and not is_after_tse_close():
+            self.failed = list(self.tickers)
+            logger.warning("東証取引終了前のため当日確定日足を取得しません")
+            return {}
         result = {}
         missing, update = [], []
         for ticker in self.tickers:
@@ -309,7 +360,7 @@ class DataLoader:
                 missing.append(ticker)
             else:
                 result[ticker] = cached
-                if cached.index[-1].date() < self.expected_day:
+                if cached.index[-1].date() <= self.expected_day:
                     update.append(ticker)
         if missing:
             self._collect_batches(missing, result, incremental=False)
@@ -317,13 +368,26 @@ class DataLoader:
             self._collect_batches(update, result, incremental=True)
         # 空や古いデータを利用して前々日のシグナルを再通知する事故を防ぐ。
         valid = {t: df for t, df in result.items()
-                 if len(df) >= 15 and df.index[-1].date() == self.expected_day}
+                 if len(df) >= 15 and df.index[-1].date() == self.expected_day
+                 and self._valid_bar(df.iloc[-1]) and t in self.refreshed}
         self.failed = [t for t in self.tickers if t not in valid]
         logger.info("株価データ %d/%d 成功、取得失敗・日付不一致 %d",
                     len(valid), len(self.tickers), len(self.failed))
         if self.failed:
             logger.warning("未取得の先頭20件: %s", ", ".join(self.failed[:20]))
         return valid
+
+    @staticmethod
+    def _valid_bar(bar):
+        try:
+            op, high, low, close, volume = (float(bar[c]) for c in
+                                             ("Open", "High", "Low", "Close", "Volume"))
+        except (KeyError, TypeError, ValueError):
+            return False
+        values = (op, high, low, close, volume)
+        return (all(np.isfinite(value) for value in values) and
+                min(op, high, low, close) > 0 and volume > 0 and
+                high >= max(op, low, close) and low <= min(op, high, close))
 
 
 # ============================================================================
@@ -728,8 +792,8 @@ def build_display_candidates(enriched, actionable):
 # 自動で記録・答え合わせするための仕組み。
 #
 # 記録タイミング：
-#   当日朝、シグナルを検出した時点で status=pending として1行追加する。
-#   このとき entry_price は「前日終値（シグナル判定の基準値）」であり、
+#   当日夕方、確定日足でシグナルを検出した時点で status=pending として1行追加する。
+#   このとき entry_price は「判定日終値（シグナル判定の基準値）」であり、
 #   実際の寄り付き価格とは異なる点に注意（後述の gap で乖離を可視化する）。
 #
 # 答え合わせタイミング：
@@ -739,7 +803,7 @@ def build_display_candidates(enriched, actionable):
 #   status=resolved に更新する。追加のAPI呼び出しは不要。
 # ============================================================================
 class SignalLogger:
-    """朝の仮説を記録し、翌営業日以降、始値エントリーを仮定して日足で検証。"""
+    """夕方の仮説を記録し、対象営業日の確定日足で始値エントリーを仮定して検証。"""
     _COLUMNS = [
         "signal_date", "as_of_date", "ticker", "name", "strategy_code",
         "matched_strategies", "strategy_label", "side", "entry_price", "stop_loss",
@@ -806,7 +870,7 @@ class SignalLogger:
         logger.info("本日の新規ログ %d件（重複は登録せず）", len(new_rows))
         return df
 
-    def resolve(self, df, data_dict):
+    def resolve(self, df, data_dict, as_of_date=None):
         if df.empty:
             return df
         write_cols = ["actual_open", "actual_high", "actual_low", "actual_close",
@@ -820,7 +884,8 @@ class SignalLogger:
         for idx in df[df["status"] == "pending"].index:
             row = df.loc[idx]
             ticker, signal_date = str(row["ticker"]), str(row["signal_date"])[:10]
-            if ticker not in data_dict or signal_date >= today_jst().isoformat():
+            cutoff = as_of_date or (today_jst() - timedelta(days=1))
+            if ticker not in data_dict or signal_date > cutoff.isoformat():
                 continue
             bars = data_dict[ticker]
             if not any(str(date)[:10] == signal_date for date in bars.index):
@@ -918,11 +983,14 @@ class Notifier:
         self.line_user_id = line_user_id
 
     @staticmethod
-    def format_message(signals: list[dict], breadth: dict[str, float]) -> str:
+    def format_message(signals: list[dict], breadth: dict[str, float],
+                       as_of_date=None, signal_date=None) -> str:
         """通知用のテキストメッセージを組み立てる。"""
-        today_str = datetime.now(JST).strftime("%Y-%m-%d")
+        as_of_date = as_of_date or today_jst()
+        signal_date = signal_date or next_session(as_of_date)
         lines = [
-            f"【デイトレ候補銘柄】{today_str}",
+            f"【翌東証営業日のデイトレ候補】対象: {signal_date}",
+            f"判定に使用した確定日足: {as_of_date}",
             f"外部市場騰落レシオ: {breadth['ad_ratio']:.1f}% / "
             f"対象銘柄平均5日乖離率 {breadth['avg_dev5']:.2f}%"
             if breadth.get("ad_ratio") is not None else
@@ -942,7 +1010,7 @@ class Notifier:
             lines.append(
                 f"■ {s['name']} ({s['ticker']}) [{s['strategy_label']} / {side_label}]\n"
                 f"  判定: {status}\n"
-                f"  前日終値（判定基準）: {s['entry_price']:.1f}円\n"
+                f"  判定日終値（基準）: {s['entry_price']:.1f}円\n"
                 f"  損切り目安    : {s['stop_loss']:.1f}円 (ATR×{s.get('atr_multiplier', 1.5):.1f})\n"
                 f"  参考株数      : {s['max_shares']}株"
                 f"（概算コスト {s['estimated_cost']:,.0f}円）\n"
@@ -1005,18 +1073,21 @@ class Notifier:
 
     @staticmethod
     def format_short_message(
-        signals: list[dict], breadth: dict[str, float], pages_url: Optional[str] = None
+        signals: list[dict], breadth: dict[str, float], pages_url: Optional[str] = None,
+        as_of_date=None, signal_date=None,
     ) -> str:
         """
         LINE等向けの短い通知文。詳細はレポートページ側に任せ、
         通知はスマホ通知欄で一目で分かる要約に絞る。
         """
-        today_str = datetime.now(JST).strftime("%Y-%m-%d")
+        as_of_date = as_of_date or today_jst()
+        signal_date = signal_date or next_session(as_of_date)
         buy_count = sum(1 for s in signals if s["side"] == "buy")
         sell_count = sum(1 for s in signals if s["side"] == "sell")
         research_count = sum(1 for s in signals if s.get("allocation_status") == "research_only")
 
-        lines = [f"【デイトレ候補】{today_str}"]
+        lines = [f"【翌東証営業日のデイトレ候補】対象: {signal_date}",
+                 f"判定に使用した確定日足: {as_of_date}"]
         if signals:
             lines.append(f"検出 {len(signals)}件（買い{buy_count} / 空売り{sell_count}）")
             lines.append(f"資金配分候補{len(signals) - research_count}件 / 参考のみ{research_count}件")
@@ -1034,8 +1105,10 @@ class Notifier:
         breadth: dict[str, float],
         dry_run: bool = False,
         pages_url: Optional[str] = None,
+        as_of_date=None,
+        signal_date=None,
     ) -> None:
-        full_message = self.format_message(signals, breadth)
+        full_message = self.format_message(signals, breadth, as_of_date, signal_date)
         print("\n" + "=" * 70)
         print(full_message)
         print("=" * 70 + "\n")
@@ -1048,7 +1121,8 @@ class Notifier:
         # 短い要約＋リンクのみ送る（pages_url未指定時はDiscordと同じ全文）。
         self.send_discord(full_message)
         short_message = (
-            self.format_short_message(signals, breadth, pages_url=pages_url)
+            self.format_short_message(signals, breadth, pages_url=pages_url,
+                                      as_of_date=as_of_date, signal_date=signal_date)
             if pages_url
             else full_message
         )
@@ -1159,12 +1233,16 @@ class ReportGenerator:
         stats: Optional[dict] = None,
         screened_count: Optional[int] = None,
         research_stats: Optional[dict] = None,
+        as_of_date=None,
+        signal_date=None,
     ) -> str:
+        as_of_date = as_of_date or today_jst()
+        signal_date = signal_date or next_session(as_of_date)
         today_str = datetime.now(JST).strftime("%Y-%m-%d (%a)")
         cards_html = "\n".join(self._render_card(s) for s in signals)
         if not signals:
             cards_html = (
-                '<p class="empty-state">本日は条件を満たす候補銘柄がありません。'
+                f'<p class="empty-state">{signal_date}向けの条件一致候補はありません。'
                 "無理に売買しないこと。</p>"
             )
 
@@ -1188,7 +1266,7 @@ class ReportGenerator:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>デイトレ候補レポート | {today_str}</title>
+<title>デイトレ候補レポート | {signal_date}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
@@ -1359,7 +1437,8 @@ class ReportGenerator:
   <div class="wrap">
     <header>
       <p class="title">DAYTRADE SIGNAL REPORT</p>
-      <p class="date">{today_str}</p>
+      <p class="date">配信日: {today_str} / 判定に使用した確定日足: {as_of_date} / 売買候補の対象営業日: {signal_date}</p>
+      <p class="date">翌東証営業日のデイトレ候補</p>
     </header>
 
     <div class="warning-banner">
@@ -1449,8 +1528,17 @@ class TradingSystem:
 
     def run(self, dry_run=False):
         logger.info("=== デイトレ v2 開始、対象%d銘柄 ===", len(self.tickers))
+        if not is_after_tse_close():
+            logger.info("東証取引終了前のため確定日足を使う処理を中止します")
+            return []
         if not is_trading_day():
             logger.info("東証休場のため本日の新規通知はスキップします")
+            return []
+        as_of_date = today_jst()
+        try:
+            signal_date = next_session(as_of_date)
+        except (RuntimeError, ValueError) as exc:
+            logger.error("東証カレンダーを確認できないため通知を中止: %s", exc)
             return []
         existing_log = self.signal_logger.load() if self.signal_logger else None
         existing_research = self.research_logger.load() if self.research_logger else None
@@ -1462,17 +1550,22 @@ class TradingSystem:
                 )
         # 対象銘柄リストから外れた過去の研究候補も答え合わせ用に価格を取得する。
         full_tickers = list(dict.fromkeys(self.tickers + pending))
-        self.data_loader = DataLoader(full_tickers, cache_dir=str(self.data_loader.cache_dir.parent))
+        self.data_loader = DataLoader(full_tickers, cache_dir=str(self.data_loader.cache_dir.parent),
+                                      as_of_date=as_of_date)
         all_data = self.data_loader.fetch_all()
         data = {t: all_data[t] for t in self.tickers if t in all_data}
         coverage = len(data) / len(self.tickers) if self.tickers else 0
-        if coverage < self.min_coverage:
-            logger.error("取得成功率 %.1f%% が基準 %.1f%% に未達。誤通知防止のため中止",
-                         coverage * 100, self.min_coverage * 100)
+        if coverage < self.min_coverage or coverage < 1.0:
+            logger.error("当日確定日足取得率 %.1f%%。全対象銘柄のデータ鮮度を確認できないため中止",
+                         coverage * 100)
             return []  # ログ上書きや'候補なし'通知はしない
+        if any(df.index[-1].date() != as_of_date or
+               not DataLoader._valid_bar(df.iloc[-1]) for df in data.values()):
+            logger.error("当日確定日足の鮮度・妥当性を確認できないため通知とログ更新を中止")
+            return []
         # 市場全体の騰落レシオは独立CSVが存在する場合のみ利用する。
         breadth = TechnicalEngine.compute_market_breadth(
-            data, breadth_file=self.breadth_file, as_of=previous_session())
+            data, breadth_file=self.breadth_file, as_of=as_of_date)
         suppress = self.risk_engine.should_suppress_reverse_buy(breadth)
         raw = self.screener.screen(data, names=self.names, suppress_reverse_buy=suppress)
         enriched = [self.risk_engine.enrich_signal(s) for s in raw]
@@ -1486,9 +1579,10 @@ class TradingSystem:
                     len(data), len(displayed), len(actionable), len(displayed) - len(actionable))
         research_stats = None
         if self.research_logger:
-            research_df, resolved = self.research_logger.resolve(existing_research, all_data)
+            research_df, resolved = self.research_logger.resolve(
+                existing_research, all_data, as_of_date=as_of_date)
             research_df, added = self.research_logger.append(
-                research_df, displayed, today_jst().isoformat(), previous_session()
+                research_df, displayed, signal_date.isoformat(), as_of_date.isoformat()
             )
             self.research_logger.save(research_df)
             research_stats = self.research_logger.summarize(research_df)
@@ -1498,21 +1592,23 @@ class TradingSystem:
                         research_stats["counts"]["skipped"])
         stats = None
         if self.signal_logger:
-            log_df = self.signal_logger.resolve(existing_log, all_data)
+            log_df = self.signal_logger.resolve(existing_log, all_data, as_of_date=as_of_date)
             log_df = self.signal_logger.append_new(
-                log_df, actionable, breadth, today_jst().isoformat(), previous_session())
+                log_df, actionable, breadth, signal_date.isoformat(), as_of_date.isoformat())
             self.signal_logger.save(log_df)
             stats = self.signal_logger.summarize(log_df)
         if self.report_path:
             html = self.report_generator.build_html(
                 displayed, breadth, capital=self.capital, risk_pct=self.risk_pct,
-                stats=stats, screened_count=len(data), research_stats=research_stats)
+                stats=stats, screened_count=len(data), research_stats=research_stats,
+                as_of_date=as_of_date, signal_date=signal_date)
             self.report_generator.save(html, self.report_path)
         notifier = Notifier(
             discord_webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"),
             line_channel_access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"),
             line_user_id=os.environ.get("LINE_USER_ID"))
-        notifier.notify(displayed, breadth, dry_run=dry_run, pages_url=self.pages_url)
+        notifier.notify(displayed, breadth, dry_run=dry_run, pages_url=self.pages_url,
+                        as_of_date=as_of_date, signal_date=signal_date)
         logger.info("=== 処理完了：選定%d、通知候補%d ===", len(data), len(actionable))
         return actionable
 
@@ -1609,9 +1705,10 @@ def load_jpx_list(path):
     return candidates[["ticker", "name", "market"]].reset_index(drop=True)
 
 
-def compute_universe_metrics(ticker, df, meta, capital):
+def compute_universe_metrics(ticker, df, meta, capital, as_of_date=None):
     """勝率ではなく流動性・値動き・シグナル発生頻度で一次選定する。"""
-    if len(df) < 120 or df.index[-1].date() != previous_session():
+    as_of_date = as_of_date or today_jst()
+    if len(df) < 120 or df.index[-1].date() != as_of_date:
         return None
     indicators = TechnicalEngine.compute_indicators(df)
     recent = indicators.tail(240)
@@ -1631,7 +1728,7 @@ def compute_universe_metrics(ticker, df, meta, capital):
     return dict(ticker=ticker, name=meta["name"], market=meta["market"],
                 avg_turnover20=round(turnover), atr_pct=round(atr_pct, 3),
                 buy_signal_days=int((a | b | d).sum()), short_signal_days=int(c.sum()),
-                data_points=len(df), last_scanned=today_jst().isoformat(),
+                data_points=len(df), last_scanned=as_of_date.isoformat(),
                 last_bar=df.index[-1].date().isoformat())
 
 
@@ -1688,6 +1785,9 @@ def load_provisional_tickers(state_file, shortable_file=None):
 def build_universe(jpx_file=None, cache_dir="cache", state_file="universe/universe_metrics.csv",
                    output_file="tickers_200.csv", batch_size=80, capital=1_000_000,
                    shortable_file=None):
+    if not is_after_tse_close():
+        logger.info("東証取引終了前のためユニバース更新を中止します")
+        return pd.DataFrame()
     path = jpx_file or fetch_jpx_source(cache_dir)
     all_issues = load_jpx_list(path)
     state_path = Path(state_file)
@@ -1711,24 +1811,32 @@ def build_universe(jpx_file=None, cache_dir="cache", state_file="universe/univer
     logger.info("JPX対象 %d件 / 過去調査 %d件 / 今回 %d件",
                 len(options), len(known), len(portion))
     tickers = [x["ticker"] for x in portion]
-    loader = DataLoader(tickers, cache_dir=cache_dir)
+    as_of_date = today_jst()
+    loader = DataLoader(tickers, cache_dir=cache_dir, as_of_date=as_of_date)
     prices = loader.fetch_all()
     records = []
     for meta in portion:
         t = meta["ticker"]
-        measure = compute_universe_metrics(t, prices[t], meta, capital) if t in prices else None
+        frame = prices.get(t)
+        if (frame is None or frame.empty or frame.index[-1].date() != as_of_date
+                or not DataLoader._valid_bar(frame.iloc[-1])):
+            logger.warning("当日確定日足がないためユニバース調査結果を保持: %s", t)
+            continue
+        measure = compute_universe_metrics(t, frame, meta, capital, as_of_date=as_of_date)
         # 条件に合わない銘柄も走査済み記録として保持し、無限再取得しない。
         records.append(measure or {"ticker": t, "name": meta["name"], "market": meta["market"],
                                   "avg_turnover20": 0, "atr_pct": 0,
                                   "buy_signal_days": 0, "short_signal_days": 0,
-                                  "data_points": len(prices.get(t, [])),
-                                  "last_scanned": today_jst().isoformat(),
-                                  "last_bar": (prices[t].index[-1].date().isoformat() if t in prices else "")})
-    fresh = pd.DataFrame(records)
-    if not state.empty:
-        state = state[~state["ticker"].isin(tickers)]
-    state = pd.concat([state, fresh], ignore_index=True).drop_duplicates("ticker", keep="last")
-    state.to_csv(state_path, index=False)
+                                  "data_points": len(frame),
+                                  "last_scanned": as_of_date.isoformat(),
+                                  "last_bar": frame.index[-1].date().isoformat()})
+    if records:
+        fresh = pd.DataFrame(records)
+        updated_tickers = fresh["ticker"].tolist()
+        if not state.empty:
+            state = state[~state["ticker"].isin(updated_tickers)]
+        state = pd.concat([state, fresh], ignore_index=True).drop_duplicates("ticker", keep="last")
+        state.to_csv(state_path, index=False)
     eligible = eligible_universe(state)
     selected = select_universe_candidates(eligible, shortable_file)
     logger.info("条件適合 %d銘柄 / 暫定選定 %d銘柄 / 全市場進捗 %d/%d",

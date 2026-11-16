@@ -1,6 +1,6 @@
 """資金配分とは独立して全シグナルを検証する研究用ログ。
 
-売買注文・実約定ではなく、翌営業日の確定日足を用いた仮想結果。
+売買注文・実約定ではなく、signal_dateの確定日足を用いた仮想結果。
 見送り条件（寄り付きギャップ等）は元の売買モデルに合わせて別集計する。
 """
 from __future__ import annotations
@@ -88,11 +88,12 @@ class ResearchSignalJournal:
                            ignore_index=True)
         return df, len(new_rows)
 
-    def resolve(self, df, prices, *, today=None):
-        """翌営業日以降にsignal_dateの確定OHLCで仮想売買結果を算定する。"""
+    def resolve(self, df, prices, *, today=None, as_of_date=None):
+        """signal_dateの確定OHLCが利用可能になった後に仮想売買結果を算定する。"""
         if df.empty:
             return df, 0
         today = today or datetime.now(JST).date()
+        cutoff = as_of_date or (today - timedelta(days=1))
         df = df.copy()
         # CSVの型推定に依存せず、更新列を単一値で安全に書き換える。
         for col in self.COLUMNS[self.COLUMNS.index("status"):]:
@@ -102,7 +103,7 @@ class ResearchSignalJournal:
             row = df.loc[idx]
             signal_day = str(row["signal_date"])[:10]
             ticker = str(row["ticker"])
-            if signal_day >= today.isoformat() or ticker not in prices:
+            if signal_day > cutoff.isoformat() or ticker not in prices:
                 continue
             bars = prices[ticker]
             match = [str(day)[:10] == signal_day for day in bars.index]
