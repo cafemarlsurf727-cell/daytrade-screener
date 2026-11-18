@@ -31,8 +31,10 @@ from __future__ import annotations
 import argparse
 import io
 import hashlib
+import json
 import random
 import re
+import tempfile
 from urllib.parse import urljoin
 import dataclasses
 import logging
@@ -966,10 +968,56 @@ class SignalLogger:
 # ============================================================================
 # 6. Notification モジュール
 # ============================================================================
+class DeliveryLedger:
+    """LINE送信済みの対象営業日を研究ログと分離して永続化する。"""
+
+    def __init__(self, path="logs/delivery_status.json"):
+        self.path = Path(path)
+
+    def load(self):
+        if not self.path.exists():
+            return {"version": 1, "deliveries": {}}
+        try:
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+            if (state.get("version") != 1 or
+                    not isinstance(state.get("deliveries"), dict)):
+                raise ValueError("unsupported delivery ledger format")
+            if any(not isinstance(entry, dict)
+                   for entry in state["deliveries"].values()):
+                raise ValueError("invalid delivery ledger entry")
+            return state
+        except Exception as exc:
+            raise ValueError(f"配信済み記録を読み取れません: {exc}") from exc
+
+    def line_sent(self, signal_date):
+        state = self.load()
+        entry = state["deliveries"].get(str(signal_date), {})
+        return entry.get("line") == "sent"
+
+    def mark_line_sent(self, signal_date):
+        state = self.load()
+        state["deliveries"].setdefault(str(signal_date), {})["line"] = "sent"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", dir=self.path.parent,
+                    prefix=f".{self.path.name}.", suffix=".tmp", delete=False) as temp:
+                temp_name = temp.name
+                json.dump(state, temp, ensure_ascii=False, indent=2, sort_keys=True)
+                temp.write("\n")
+                temp.flush()
+                os.fsync(temp.fileno())
+            os.replace(temp_name, self.path)
+        finally:
+            if temp_name and os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+
 class Notifier:
     """
-    スクリーニング結果を整形し、Discord Webhook / LINE Messaging API に
-    送信するクラス。
+    スクリーニング結果を整形し、LINE Messaging API に送信するクラス。
+    Discord送信は無効。
     """
 
     def __init__(
@@ -1023,24 +1071,8 @@ class Notifier:
         return "\n".join(lines)
 
     def send_discord(self, message: str) -> bool:
-        if not self.discord_webhook_url:
-            logger.info("DISCORD_WEBHOOK_URL 未設定のため Discord 通知はスキップします。")
-            return False
-        try:
-            # Discordは1メッセージ2000文字制限があるため分割送信する
-            chunks = [message[i:i + 1900] for i in range(0, len(message), 1900)] or [message]
-            for chunk in chunks:
-                resp = requests.post(
-                    self.discord_webhook_url,
-                    json={"content": chunk},
-                    timeout=10,
-                )
-                resp.raise_for_status()
-            logger.info("Discord通知を送信しました。")
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Discord通知の送信に失敗しました: %s", exc)
-            return False
+        logger.info("Discord通知は無効です。LINEのみを正式な通知先として扱います。")
+        return False
 
     def send_line(self, message: str) -> bool:
         if not (self.line_channel_access_token and self.line_user_id):
@@ -1107,26 +1139,28 @@ class Notifier:
         pages_url: Optional[str] = None,
         as_of_date=None,
         signal_date=None,
-    ) -> None:
+    ) -> bool:
         full_message = self.format_message(signals, breadth, as_of_date, signal_date)
         print("\n" + "=" * 70)
         print(full_message)
         print("=" * 70 + "\n")
 
         if dry_run:
-            logger.info("--dry-run 指定のため外部通知は送信しません。")
-            return
+            logger.info("LINE通知スキップ: --dry-run 指定のため送信しません。")
+            return False
 
-        # Discordは詳細をそのまま送る。LINEはレポートページへの導線として
-        # 短い要約＋リンクのみ送る（pages_url未指定時はDiscordと同じ全文）。
-        self.send_discord(full_message)
+        # 正式な通知先はLINEのみ。Discord送信結果は配信判定に使わない。
+        logger.info("Discord通知は無効です。LINEのみを正式な通知先として扱います。")
         short_message = (
             self.format_short_message(signals, breadth, pages_url=pages_url,
                                       as_of_date=as_of_date, signal_date=signal_date)
             if pages_url
             else full_message
         )
-        self.send_line(short_message)
+        if not (self.line_channel_access_token and self.line_user_id):
+            logger.error("LINE通知スキップ: LINE認証情報が未設定です。")
+            return False
+        return self.send_line(short_message)
 
 
 # ============================================================================
@@ -1502,7 +1536,8 @@ class TradingSystem:
                  breadth_file=None, shortable_file=None, max_positions=3,
                  portfolio_risk_pct=0.03, min_coverage=0.90,
                  max_gap_pct=5.0, slippage_pct=0.001,
-                 research_log_path=None):
+                 research_log_path=None,
+                 delivery_state_path="logs/delivery_status.json"):
         self.tickers = list(dict.fromkeys(tickers))
         self.names = names or {}
         self.capital = capital
@@ -1525,11 +1560,12 @@ class TradingSystem:
                                   slippage_pct=slippage_pct)
             if research_log_path else None
         )
+        self.delivery_ledger = DeliveryLedger(delivery_state_path) if delivery_state_path else None
 
     def run(self, dry_run=False):
         logger.info("=== デイトレ v2 開始、対象%d銘柄 ===", len(self.tickers))
         if not is_after_tse_close():
-            logger.info("東証取引終了前のため確定日足を使う処理を中止します")
+            logger.info("RESULT=stopped_preclose 東証取引終了前のため処理を中止")
             return []
         if not is_trading_day():
             logger.info("東証休場のため本日の新規通知はスキップします")
@@ -1540,6 +1576,14 @@ class TradingSystem:
         except (RuntimeError, ValueError) as exc:
             logger.error("東証カレンダーを確認できないため通知を中止: %s", exc)
             return []
+        if self.delivery_ledger:
+            try:
+                if self.delivery_ledger.line_sent(signal_date):
+                    logger.info("RESULT=skipped_already_sent 対象営業日%sのLINE配信済み", signal_date)
+                    return []
+            except ValueError as exc:
+                logger.error("RESULT=stopped_delivery_state_unreadable %s", exc)
+                return []
         existing_log = self.signal_logger.load() if self.signal_logger else None
         existing_research = self.research_logger.load() if self.research_logger else None
         pending = []
@@ -1556,12 +1600,12 @@ class TradingSystem:
         data = {t: all_data[t] for t in self.tickers if t in all_data}
         coverage = len(data) / len(self.tickers) if self.tickers else 0
         if coverage < self.min_coverage or coverage < 1.0:
-            logger.error("当日確定日足取得率 %.1f%%。全対象銘柄のデータ鮮度を確認できないため中止",
+            logger.error("RESULT=stopped_missing_confirmed_bars 当日確定日足取得率 %.1f%%。全対象銘柄のデータ鮮度を確認できないため中止",
                          coverage * 100)
             return []  # ログ上書きや'候補なし'通知はしない
         if any(df.index[-1].date() != as_of_date or
                not DataLoader._valid_bar(df.iloc[-1]) for df in data.values()):
-            logger.error("当日確定日足の鮮度・妥当性を確認できないため通知とログ更新を中止")
+            logger.error("RESULT=stopped_missing_confirmed_bars 当日確定日足の鮮度・妥当性を確認できないため通知とログ更新を中止")
             return []
         # 市場全体の騰落レシオは独立CSVが存在する場合のみ利用する。
         breadth = TechnicalEngine.compute_market_breadth(
@@ -1598,17 +1642,37 @@ class TradingSystem:
             self.signal_logger.save(log_df)
             stats = self.signal_logger.summarize(log_df)
         if self.report_path:
-            html = self.report_generator.build_html(
-                displayed, breadth, capital=self.capital, risk_pct=self.risk_pct,
-                stats=stats, screened_count=len(data), research_stats=research_stats,
-                as_of_date=as_of_date, signal_date=signal_date)
-            self.report_generator.save(html, self.report_path)
+            try:
+                html = self.report_generator.build_html(
+                    displayed, breadth, capital=self.capital, risk_pct=self.risk_pct,
+                    stats=stats, screened_count=len(data), research_stats=research_stats,
+                    as_of_date=as_of_date, signal_date=signal_date)
+                self.report_generator.save(html, self.report_path)
+            except Exception:
+                logger.exception("RESULT=report_generation_failed レポート生成に失敗")
+                return []
         notifier = Notifier(
             discord_webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"),
             line_channel_access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"),
             line_user_id=os.environ.get("LINE_USER_ID"))
-        notifier.notify(displayed, breadth, dry_run=dry_run, pages_url=self.pages_url,
-                        as_of_date=as_of_date, signal_date=signal_date)
+        sent = notifier.notify(displayed, breadth, dry_run=dry_run, pages_url=self.pages_url,
+                               as_of_date=as_of_date, signal_date=signal_date)
+        if dry_run:
+            logger.info("RESULT=notification_skipped_dry_run LINE送信なし")
+        elif not sent:
+            logger.error("RESULT=notification_failed LINE送信失敗または認証情報未設定。後続実行で再試行可能")
+        elif self.delivery_ledger:
+            try:
+                self.delivery_ledger.mark_line_sent(signal_date)
+            except Exception as exc:
+                logger.exception("RESULT=notification_state_save_failed LINE成功応答後に配信済み記録を保存できませんでした")
+                raise RuntimeError(
+                    f"LINE送信成功後の配信済み記録保存に失敗しました: {exc}"
+                ) from exc
+            logger.info("RESULT=notification_sent LINE成功応答を記録（端末到達の保証ではありません） 対象営業日%s",
+                        signal_date)
+        else:
+            logger.error("RESULT=notification_state_unavailable LINE送信済み記録先が無効です")
         logger.info("=== 処理完了：選定%d、通知候補%d ===", len(data), len(actionable))
         return actionable
 
@@ -1870,6 +1934,9 @@ def parse_args():
     parser.add_argument("--research-log-path", type=str,
                         default="logs/research_signal_log.csv",
                         help="全シグナルの資金額と独立した研究用成績CSV")
+    parser.add_argument("--delivery-state-path", type=str,
+                        default="logs/delivery_status.json",
+                        help="LINE送信済み対象営業日の永続記録")
     parser.add_argument("--build-universe", action="store_true", help="JPXから200銘柄を分割自動選定")
     parser.add_argument("--jpx-file", type=str, default=None, help="公式JPX一覧のxls/xlsx/csv")
     parser.add_argument("--universe-batch-size", type=int, default=80)
@@ -1918,7 +1985,8 @@ def main():
         max_positions=args.max_positions, portfolio_risk_pct=args.portfolio_risk_pct,
         min_coverage=args.min_coverage, max_gap_pct=args.max_gap_pct,
         slippage_pct=args.slippage_pct,
-        research_log_path=args.research_log_path)
+        research_log_path=args.research_log_path,
+        delivery_state_path=args.delivery_state_path)
     system.run(dry_run=args.dry_run)
 
 
